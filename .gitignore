@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+!.env.*.example
+terraform/terraform.tfvars
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/.terraform/
+terraform/.generated-backend.tf
+*:Zone.Identifier

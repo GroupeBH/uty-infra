@@ -1,0 +1,46 @@
+services:
+  app:
+    image: {{ app_image_repository }}:{{ app_image_tag }}
+    container_name: nestjs-app
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+{% if app_env_file | default('') | length > 0 %}
+    env_file:
+      - .env
+{% endif %}
+    ports:
+      - "127.0.0.1:3000:3000"
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: "{{ aws_region }}"
+        awslogs-group: "/{{ instance_name }}/app"
+        awslogs-stream: "app-{{ inventory_hostname }}"
+        awslogs-create-group: "false"
+
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: caddy
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: "{{ aws_region }}"
+        awslogs-group: "/{{ instance_name }}/caddy"
+        awslogs-stream: "caddy-{{ inventory_hostname }}"
+        awslogs-create-group: "false"
+
+volumes:
+  caddy_data:
+  caddy_config:

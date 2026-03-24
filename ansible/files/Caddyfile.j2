@@ -1,0 +1,16 @@
+{% if domain_name | default('') | length > 0 %}
+{% if caddy_email | default('') | length > 0 %}
+{
+  email {{ caddy_email }}
+}
+{% endif %}
+{{ domain_name }} {
+  encode zstd gzip
+  reverse_proxy app:3000
+}
+{% else %}
+:80 {
+  encode zstd gzip
+  reverse_proxy app:3000
+}
+{% endif %}

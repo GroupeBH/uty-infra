@@ -1,0 +1,286 @@
+- name: Deploy uty API behind Caddy
+  hosts: app
+  gather_facts: false
+  become: true
+  serial: 1
+  any_errors_fatal: true
+
+  vars:
+    deploy_root: /opt/nestjs-caddy
+    docker_compose_file: "{{ deploy_root }}/docker-compose.yml"
+    caddyfile_path: "{{ deploy_root }}/Caddyfile"
+    local_app_env_file: "{{ app_env_file | default('') }}"
+    dockerhub_username: "{{ lookup('env', 'DOCKERHUB_USERNAME') | default('', true) }}"
+    dockerhub_token: "{{ lookup('env', 'DOCKERHUB_TOKEN') | default('', true) }}"
+    app_container_name: nestjs-app
+
+  pre_tasks:
+    - name: Validate mandatory inputs
+      ansible.builtin.assert:
+        that:
+          - admin_cidr is defined
+          - admin_cidr | length > 0
+          - aws_region is defined
+          - aws_region | length > 0
+          - app_image_repository is defined
+          - app_image_repository | length > 0
+          - app_image_tag is defined
+          - app_image_tag | length > 0
+          - instance_name is defined
+          - instance_name | length > 0
+          - app_healthcheck_path is defined
+          - app_healthcheck_path | length > 0
+        fail_msg: "Missing one of the required deployment variables for the uty API stack."
+
+    - name: Validate optional local env file path
+      ansible.builtin.stat:
+        path: "{{ local_app_env_file }}"
+      delegate_to: localhost
+      become: false
+      register: local_env_file_stat
+      when: local_app_env_file | length > 0
+
+    - name: Fail when the local env file does not exist
+      ansible.builtin.assert:
+        that:
+          - local_env_file_stat.stat.exists
+          - local_env_file_stat.stat.isreg
+        fail_msg: "The APP_ENV_FILE path does not exist or is not a regular file on the control node."
+      when: local_app_env_file | length > 0
+
+    - name: Detect Ubuntu codename without full fact gathering
+      ansible.builtin.raw: . /etc/os-release && printf '%s' "$VERSION_CODENAME"
+      register: os_release_codename
+      changed_when: false
+
+    - name: Set deployment facts
+      ansible.builtin.set_fact:
+        ubuntu_codename: "{{ os_release_codename.stdout | trim }}"
+        remote_login_user: "{{ ansible_user | default('ubuntu') }}"
+
+    - name: Validate detected Ubuntu codename
+      ansible.builtin.assert:
+        that:
+          - ubuntu_codename | length > 0
+        fail_msg: "Could not detect the Ubuntu release codename on the target host."
+
+  tasks:
+    - name: Install base packages
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - python3
+          - python3-apt
+          - ufw
+        state: present
+
+    - name: Create Docker apt keyring directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Download Docker GPG key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+        force: true
+
+    - name: Add Docker apt repository
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ubuntu_codename }} stable"
+        filename: docker
+        state: present
+        update_cache: true
+
+    - name: Install Docker Engine and Compose plugin
+      ansible.builtin.apt:
+        name:
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-ce
+          - docker-ce-cli
+          - docker-compose-plugin
+        state: present
+
+    - name: Ensure Docker service is enabled and started
+      ansible.builtin.service:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Add the SSH user to the docker group
+      ansible.builtin.user:
+        name: "{{ remote_login_user }}"
+        groups: docker
+        append: true
+
+    - name: Create deployment directory
+      ansible.builtin.file:
+        path: "{{ deploy_root }}"
+        state: directory
+        mode: "0755"
+
+    - name: Render docker-compose.yml
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/files/docker-compose.yml.j2"
+        dest: "{{ docker_compose_file }}"
+        mode: "0644"
+
+    - name: Render Caddyfile
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/files/Caddyfile.j2"
+        dest: "{{ caddyfile_path }}"
+        mode: "0644"
+
+    - name: Copy application env file when provided
+      ansible.builtin.copy:
+        src: "{{ local_app_env_file }}"
+        dest: "{{ deploy_root }}/.env"
+        mode: "0600"
+      when: local_app_env_file | length > 0
+
+    - name: Remove stale application env file when not provided
+      ansible.builtin.file:
+        path: "{{ deploy_root }}/.env"
+        state: absent
+      when: local_app_env_file | length == 0
+
+    - name: Docker Hub login when credentials are present
+      ansible.builtin.shell: |
+        set -eu
+        printf '%s' "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+      args:
+        executable: /bin/bash
+      environment:
+        DOCKERHUB_USERNAME: "{{ dockerhub_username }}"
+        DOCKERHUB_TOKEN: "{{ dockerhub_token }}"
+      no_log: true
+      when:
+        - dockerhub_username | length > 0
+        - dockerhub_token | length > 0
+
+    - name: Pull the application image
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ docker_compose_file }}"
+          - pull
+          - app
+      changed_when: true
+
+    - name: Start the stack
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ docker_compose_file }}"
+          - up
+          - -d
+          - --remove-orphans
+      changed_when: true
+
+    - name: Wait for the app container to be ready
+      block:
+        - name: Inspect container state
+          ansible.builtin.shell: |
+            set -eu
+            state="$(docker inspect --format='{% raw %}{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}missing-healthcheck{{end}}{% endraw %}' {{ app_container_name }} 2>/dev/null || echo 'missing|missing')"
+            echo "$state"
+            case "$state" in
+              running\|healthy|running\|missing-healthcheck)
+                exit 0
+                ;;
+              *)
+                exit 1
+                ;;
+            esac
+          args:
+            executable: /bin/bash
+          register: app_readiness
+          changed_when: false
+          retries: 20
+          delay: 5
+          until: app_readiness.rc == 0
+      rescue:
+        - name: Collect docker compose status after readiness failure
+          ansible.builtin.command:
+            argv:
+              - docker
+              - compose
+              - -f
+              - "{{ docker_compose_file }}"
+              - ps
+          register: docker_compose_ps_failure
+          changed_when: false
+          failed_when: false
+
+        - name: Collect app logs after readiness failure
+          ansible.builtin.command:
+            argv:
+              - docker
+              - compose
+              - -f
+              - "{{ docker_compose_file }}"
+              - logs
+              - app
+              - --tail=100
+          register: app_logs_failure
+          changed_when: false
+          failed_when: false
+
+        - name: Stop deployment when the app is not ready
+          ansible.builtin.fail:
+            msg: |
+              App container did not become ready.
+              docker compose ps:
+              {{ docker_compose_ps_failure.stdout | default('') }}
+
+              docker compose logs app --tail=100:
+              {{ app_logs_failure.stdout | default('') }}
+
+    - name: Show docker compose status
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ docker_compose_file }}"
+          - ps
+      register: docker_compose_ps
+      changed_when: false
+
+    - name: Display docker compose status
+      ansible.builtin.debug:
+        var: docker_compose_ps.stdout_lines
+
+    - name: Configure UFW
+      ansible.builtin.shell: |
+        set -eu
+        ufw --force reset
+        ufw default deny incoming
+        ufw default allow outgoing
+        ufw allow from {{ admin_cidr }} to any port 22 proto tcp
+        ufw allow 80/tcp
+        ufw allow 443/tcp
+        ufw --force enable
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Reset SSH connection after group and firewall changes
+      ansible.builtin.meta: reset_connection
+
+    - name: Wait for SSH to be reachable again
+      ansible.builtin.wait_for_connection:
+        delay: 2
+        timeout: 60
