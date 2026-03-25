@@ -125,25 +125,33 @@
       ansible.builtin.file:
         path: "{{ deploy_root }}"
         state: directory
+        owner: "{{ remote_login_user }}"
+        group: docker
         mode: "0755"
 
     - name: Render docker-compose.yml
       ansible.builtin.template:
         src: "{{ playbook_dir }}/files/docker-compose.yml.j2"
         dest: "{{ docker_compose_file }}"
+        owner: "{{ remote_login_user }}"
+        group: docker
         mode: "0644"
 
     - name: Render Caddyfile
       ansible.builtin.template:
         src: "{{ playbook_dir }}/files/Caddyfile.j2"
         dest: "{{ caddyfile_path }}"
+        owner: "{{ remote_login_user }}"
+        group: docker
         mode: "0644"
 
     - name: Copy application env file when provided
       ansible.builtin.copy:
         src: "{{ local_app_env_file }}"
         dest: "{{ deploy_root }}/.env"
-        mode: "0600"
+        owner: "{{ remote_login_user }}"
+        group: docker
+        mode: "0640"
       when: local_app_env_file | length > 0
 
     - name: Remove stale application env file when not provided
@@ -187,6 +195,7 @@
           - up
           - -d
           - --remove-orphans
+          - --force-recreate
       changed_when: true
 
     - name: Wait for the app container to be ready
