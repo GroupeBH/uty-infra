@@ -1,42 +1,44 @@
-# Manual failover runbook for uty-api
+# Traffic drain and failover runbook for uty-api
 
 ## Scope
 
-Ce runbook sert à basculer le trafic du primaire vers le secondaire, puis éventuellement à revenir sur le primaire après rétablissement.
+Ce runbook sert a retirer un noeud degrade du trafic public, a continuer le service sur le noeud restant, puis eventuellement a reintroduire le noeud repare.
 
-## Pré-requis
+## Pre-requis
 
-- accès AWS valide
-- accès au provider DNS externe
+- acces AWS valide
+- acces au provider DNS externe
 - `terraform output` disponible localement
-- accès SSH aux deux instances
-- connaissance du TTL DNS courant, idéalement `60s`
+- acces SSH aux deux instances
+- connaissance du TTL DNS courant, idealement `60s`
 
 ## Rappels
 
-- en nominal, le DNS pointe vers l'Elastic IP primaire
-- le secondaire reste en standby
-- les deux nœuds sont déployés avec la même application, mais un seul doit recevoir le trafic public normal
+- chaque noeud execute Caddy et la meme application
+- Caddy peut router vers le backend local et le backend distant
+- si votre DNS externe le permet, vous pouvez publier les 2 Elastic IPs en parallele
+- si vous restez avec un seul `A` record public, ce runbook revient a basculer ce record entre les 2 noeuds
 
-## Étape 1: qualifier l'incident
+## Etape 1: qualifier l'incident
 
-Vérifier les outputs utiles:
+Verifier les outputs utiles:
 
 ```bash
 terraform -chdir=terraform output elastic_ip
 terraform -chdir=terraform output secondary_elastic_ip
 terraform -chdir=terraform output health_url
 terraform -chdir=terraform output external_dns_failover_targets
+terraform -chdir=terraform output external_dns_active_active_targets
 ```
 
-Vérifier l'état AWS:
+Verifier l'etat AWS:
 
 ```bash
 aws ec2 describe-instance-status --region us-east-1 --include-all-instances
 aws cloudwatch describe-alarms --region us-east-1 --alarm-name-prefix uty-api
 ```
 
-Tester la santé HTTP:
+Tester la sante HTTP:
 
 ```bash
 curl -i http://<primary_eip>/health
@@ -44,14 +46,14 @@ curl -i http://<secondary_eip>/health
 curl -i https://api.example.com/health
 ```
 
-Si le domaine est en HTTPS, gardez en tête que le secondaire peut avoir besoin de reprendre le certificat après bascule DNS.
+Si le domaine est en HTTPS, gardez en tete que Caddy multi-noeud sans stockage partage reste moins previsible qu'une terminaison TLS centralisee.
 
-## Étape 2: valider le secondaire avant la bascule
+## Etape 2: identifier le noeud a retirer ou a promouvoir
 
-SSH sur le secondaire:
+SSH sur le noeud qui doit continuer a porter le trafic:
 
 ```bash
-ssh -i ~/.ssh/my-ec2-key.pem ubuntu@<secondary_eip>
+ssh -i ~/.ssh/my-ec2-key.pem ubuntu@<healthy_eip>
 ```
 
 Puis:
@@ -65,62 +67,67 @@ docker inspect nestjs-app
 curl -i http://127.0.0.1:3000/health
 ```
 
-Le conteneur `nestjs-app` doit être `running`, avec un état `healthy` si l'image définit un healthcheck, sinon `running` sans healthcheck reste acceptable dans ce design.
+Le noeud sain doit repondre localement et continuer a voir l'autre backend si celui-ci est encore partiellement disponible.
 
-## Étape 3: basculer le DNS externe
+## Etape 3: mettre a jour le DNS externe
 
-Mettre à jour le `A` record du domaine pour pointer vers l'Elastic IP secondaire.
+Choisir la strategie adaptee a votre mode DNS:
 
-Règles d'exploitation:
+- si vous avez 2 `A` records actifs, retirez l'IP du noeud degrade
+- si vous avez un seul `A` record, pointez-le vers l'Elastic IP du noeud sain
 
-- ne garder qu'une seule cible active à la fois
+Regles d'exploitation:
+
+- garder uniquement des cibles saines dans le DNS
 - conserver un TTL bas
-- documenter l'heure exacte de la bascule
+- documenter l'heure exacte du drain ou de la bascule
 
-Après modification DNS, vérifier:
+Apres modification DNS, verifier:
 
 ```bash
 dig +short api.example.com
 curl -i https://api.example.com/health
 ```
 
-Si HTTPS ne répond pas immédiatement, attendre la fenêtre de propagation et laisser Caddy finaliser le certificat sur le secondaire.
+Si HTTPS ne repond pas immediatement, attendre la fenetre de propagation et verifier l'etat des certificats sur le noeud qui recoit le trafic.
 
-## Étape 4: stabiliser après failover
+## Etape 4: stabiliser apres changement de trafic
 
 Surveiller:
 
 ```bash
+aws logs tail /uty-api/app --follow --region us-east-1
+aws logs tail /uty-api/caddy --follow --region us-east-1
 aws logs tail /uty-api-secondary/app --follow --region us-east-1
 aws logs tail /uty-api-secondary/caddy --follow --region us-east-1
 ```
 
-Contrôler aussi les métriques EC2 et les alarmes CloudWatch.
+Controler aussi les metriques EC2 et les alarmes CloudWatch.
 
-## Étape 5: communiquer l'état
+## Etape 5: communiquer l'etat
 
 Partager au minimum:
 
-- heure de début d'incident
-- raison du failover
-- nouvelle cible DNS
-- validation du healthcheck côté secondaire
+- heure de debut d'incident
+- raison du drain ou du failover
+- cible ou cibles DNS restantes
+- validation du healthcheck cote noeud sain
 - statut TLS si domaine HTTPS
 
-## Failback vers le primaire
+## Reintroduction du noeud repare
 
-Une fois le primaire corrigé:
+Une fois le noeud repare:
 
-1. vérifier le primaire en direct par son EIP
-2. redéployer si nécessaire avec `deploy.sh`
-3. contrôler `docker compose ps`, logs et healthcheck local
-4. rebasculer le DNS externe vers l'Elastic IP primaire
-5. revérifier le domaine et les logs applicatifs
+1. verifier le noeud en direct par son EIP
+2. redeployer si necessaire avec `deploy.sh`
+3. controler `docker compose ps`, logs et healthcheck local
+4. remettre son IP dans le DNS si vous utilisez 2 `A` records, ou rebasculer le `A` record unique si c'est votre strategie
+5. reverifier le domaine et les logs applicatifs
 
-Commandes utiles sur le primaire:
+Commandes utiles sur un noeud:
 
 ```bash
-ssh -i ~/.ssh/my-ec2-key.pem ubuntu@<primary_eip>
+ssh -i ~/.ssh/my-ec2-key.pem ubuntu@<node_eip>
 cd /opt/nestjs-caddy
 docker compose pull app
 docker compose up -d --remove-orphans
@@ -128,7 +135,7 @@ docker compose ps
 curl -i http://127.0.0.1:3000/health
 ```
 
-## Débug rapide
+## Debug rapide
 
 Terraform:
 
@@ -153,7 +160,7 @@ docker compose logs caddy --tail=100
 docker inspect nestjs-app
 ```
 
-Système:
+Systeme:
 
 ```bash
 systemctl status docker
@@ -161,18 +168,11 @@ sudo ufw status verbose
 journalctl -u docker --no-pager -n 100
 ```
 
-CloudWatch Logs:
-
-```bash
-aws logs tail /uty-api/app --follow --region us-east-1
-aws logs tail /uty-api-secondary/app --follow --region us-east-1
-```
-
 ## Ce que ce runbook ne fait pas
 
-- pas de failover automatique
-- pas de fencing applicatif avancé
-- pas de synchronisation de données locales
-- pas de garantie TLS instantanée sur le nœud passif sans préparation spécifique
+- pas de failover global automatique
+- pas de fencing applicatif avance
+- pas de synchronisation de donnees locales
+- pas de garantie TLS multi-noeud equivalente a ALB + ACM sans preparation specifique
 
-C'est un runbook volontairement simple et robuste pour un modèle low-cost.
+C'est un runbook volontairement simple et robuste pour un modele low-cost pilote par DNS externe.

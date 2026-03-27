@@ -48,6 +48,21 @@ output "elastic_ips" {
   ])
 }
 
+output "private_ip" {
+  value = aws_instance.primary.private_ip
+}
+
+output "secondary_private_ip" {
+  value = try(aws_instance.secondary[0].private_ip, null)
+}
+
+output "private_ips" {
+  value = compact([
+    aws_instance.primary.private_ip,
+    try(aws_instance.secondary[0].private_ip, null),
+  ])
+}
+
 output "ssh_command" {
   value = "ssh -i <private-key-path> ubuntu@${aws_eip.primary.public_ip}"
 }
@@ -69,6 +84,15 @@ output "external_dns_failover_targets" {
     secondary_public_ip = try(aws_eip.secondary[0].public_ip, null)
     domain_name         = var.domain_name
     suggested_ttl       = 60
+  }
+}
+
+output "external_dns_active_active_targets" {
+  value = {
+    public_ips         = compact([aws_eip.primary.public_ip, try(aws_eip.secondary[0].public_ip, null)])
+    domain_name        = var.domain_name
+    suggested_ttl      = 60
+    suggested_strategy = var.secondary_instance_enabled ? "publish both A records when your DNS provider and TLS strategy allow it" : "publish the primary A record"
   }
 }
 
@@ -130,6 +154,14 @@ output "deploy_primary_public_ip" {
 
 output "deploy_secondary_public_ip" {
   value = try(aws_eip.secondary[0].public_ip, "")
+}
+
+output "deploy_primary_private_ip" {
+  value = aws_instance.primary.private_ip
+}
+
+output "deploy_secondary_private_ip" {
+  value = try(aws_instance.secondary[0].private_ip, "")
 }
 
 output "deploy_secondary_enabled" {

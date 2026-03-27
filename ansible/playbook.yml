@@ -12,7 +12,7 @@
     local_app_env_file: "{{ app_env_file | default('') }}"
     dockerhub_username: "{{ lookup('env', 'DOCKERHUB_USERNAME') | default('', true) }}"
     dockerhub_token: "{{ lookup('env', 'DOCKERHUB_TOKEN') | default('', true) }}"
-    app_container_name: nestjs-app
+    app_port: 3000
 
   pre_tasks:
     - name: Validate mandatory inputs
@@ -28,6 +28,8 @@
           - app_image_tag | length > 0
           - instance_name is defined
           - instance_name | length > 0
+          - private_ip is defined
+          - private_ip | length > 0
           - app_healthcheck_path is defined
           - app_healthcheck_path | length > 0
         fail_msg: "Missing one of the required deployment variables for the uty API stack."
@@ -57,6 +59,23 @@
       ansible.builtin.set_fact:
         ubuntu_codename: "{{ os_release_codename.stdout | trim }}"
         remote_login_user: "{{ ansible_user | default('ubuntu') }}"
+        app_cluster_private_ips: >-
+          {{
+            groups['app']
+            | map('extract', hostvars, 'private_ip')
+            | reject('equalto', '')
+            | reject('equalto', None)
+            | list
+          }}
+        app_peer_private_ips: >-
+          {{
+            groups['app']
+            | difference([inventory_hostname])
+            | map('extract', hostvars, 'private_ip')
+            | reject('equalto', '')
+            | reject('equalto', None)
+            | list
+          }}
 
     - name: Validate detected Ubuntu codename
       ansible.builtin.assert:
@@ -200,26 +219,17 @@
 
     - name: Wait for the app container to be ready
       block:
-        - name: Inspect container state
+        - name: Probe the local app health endpoint
           ansible.builtin.shell: |
             set -eu
-            state="$(docker inspect --format='{% raw %}{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}missing-healthcheck{{end}}{% endraw %}' {{ app_container_name }} 2>/dev/null || echo 'missing|missing')"
-            echo "$state"
-            case "$state" in
-              running\|healthy|running\|missing-healthcheck)
-                exit 0
-                ;;
-              *)
-                exit 1
-                ;;
-            esac
+            curl --silent --show-error --fail http://127.0.0.1:{{ app_port }}{{ app_healthcheck_path }} >/dev/null
           args:
             executable: /bin/bash
-          register: app_readiness
+          register: app_healthcheck
           changed_when: false
           retries: 20
           delay: 5
-          until: app_readiness.rc == 0
+          until: app_healthcheck.rc == 0
       rescue:
         - name: Collect docker compose status after readiness failure
           ansible.builtin.command:
@@ -279,6 +289,9 @@
         ufw default deny incoming
         ufw default allow outgoing
         ufw allow from {{ admin_cidr }} to any port 22 proto tcp
+        {% for cluster_ip in app_cluster_private_ips %}
+        ufw allow from {{ cluster_ip }} to any port {{ app_port }} proto tcp
+        {% endfor %}
         ufw allow 80/tcp
         ufw allow 443/tcp
         ufw --force enable

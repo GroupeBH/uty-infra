@@ -183,6 +183,14 @@ resource "aws_security_group" "app" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  ingress {
+    description = "App traffic between uty API nodes"
+    from_port   = 3000
+    to_port     = 3000
+    protocol    = "tcp"
+    self        = true
+  }
+
   egress {
     description = "Allow all outbound traffic"
     from_port   = 0

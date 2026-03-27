@@ -5,13 +5,13 @@ services:
     restart: unless-stopped
     environment:
       NODE_ENV: production
-      PORT: "3000"
+      PORT: "{{ app_port }}"
 {% if app_env_file | default('') | length > 0 %}
     env_file:
       - .env
 {% endif %}
     ports:
-      - "127.0.0.1:3000:3000"
+      - "0.0.0.0:{{ app_port }}:{{ app_port }}"
     logging:
       driver: awslogs
       options:

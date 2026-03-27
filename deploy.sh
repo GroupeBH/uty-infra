@@ -304,8 +304,10 @@ terraform -chdir="$TERRAFORM_DIR" apply "${TF_APPLY_ARGS[@]}"
 
 log "Reading Terraform outputs"
 PRIMARY_IP="$(terraform_output_raw deploy_primary_public_ip)"
+PRIMARY_PRIVATE_IP="$(terraform_output_raw deploy_primary_private_ip)"
 SECONDARY_ENABLED="$(terraform_output_raw deploy_secondary_enabled)"
 SECONDARY_IP="$(terraform_output_raw deploy_secondary_public_ip || true)"
+SECONDARY_PRIVATE_IP="$(terraform_output_raw deploy_secondary_private_ip || true)"
 DEPLOY_REGION="$(terraform_output_raw deploy_region)"
 DEPLOY_ADMIN_CIDR="$(terraform_output_raw deploy_admin_cidr)"
 DEPLOY_INSTANCE_NAME="$(terraform_output_raw deploy_instance_name)"
@@ -318,14 +320,15 @@ DEPLOY_APP_HEALTHCHECK_PATH="$(terraform_output_raw deploy_app_healthcheck_path)
 log "Generating Ansible inventory"
 cat > "$ANSIBLE_DIR/inventory.ini" <<EOF
 [app]
-primary ansible_host=$PRIMARY_IP ansible_user=$SSH_USER instance_name=$DEPLOY_INSTANCE_NAME
+primary ansible_host=$PRIMARY_IP ansible_user=$SSH_USER instance_name=$DEPLOY_INSTANCE_NAME private_ip=$PRIMARY_PRIVATE_IP
 EOF
 
 if [[ "$SECONDARY_ENABLED" == "true" && -n "$SECONDARY_IP" ]]; then
-  printf 'secondary ansible_host=%s ansible_user=%s instance_name=%s\n' \
+  printf 'secondary ansible_host=%s ansible_user=%s instance_name=%s private_ip=%s\n' \
     "$SECONDARY_IP" \
     "$SSH_USER" \
-    "${DEPLOY_INSTANCE_NAME}-secondary" >> "$ANSIBLE_DIR/inventory.ini"
+    "${DEPLOY_INSTANCE_NAME}-secondary" \
+    "$SECONDARY_PRIVATE_IP" >> "$ANSIBLE_DIR/inventory.ini"
 fi
 
 log "Waiting for SSH on primary ($PRIMARY_IP)"
@@ -357,7 +360,7 @@ ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook \
   "$ANSIBLE_DIR/playbook.yml"
 
 log "Deployment completed"
-log "Primary URL target: $PRIMARY_IP"
+log "Primary public ingress target: $PRIMARY_IP"
 if [[ "$SECONDARY_ENABLED" == "true" && -n "$SECONDARY_IP" ]]; then
-  log "Secondary standby target: $SECONDARY_IP"
+  log "Additional public ingress target: $SECONDARY_IP"
 fi

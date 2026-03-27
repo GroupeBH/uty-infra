@@ -20,7 +20,7 @@ caddy_email = "ops@example.com"
 
 app_image_repository = "dockerhub-user/uty-api"
 app_image_tag        = "latest"
-app_healthcheck_path = "/health"
+app_healthcheck_path = "/categories"
 
 log_retention_days    = 14
 alarm_email_endpoints = ["ops@example.com"]

@@ -1,29 +1,31 @@
 # uty AWS infra
 
-Cette base déploie une API NestJS packagée sur Docker Hub derrière Caddy, avec une architecture AWS simple, low-cost et opérable: un nœud primaire, un nœud secondaire de secours, des Elastic IPs fixes, un DNS externe à AWS, Terraform pour le provisioning et Ansible pour la configuration système et le déploiement applicatif.
+Cette base deploie une API NestJS packagee sur Docker Hub derriere Caddy, avec une architecture AWS simple, low-cost et plus robuste: deux noeuds EC2, une Elastic IP par noeud, un DNS externe a AWS, Terraform pour le provisioning et Ansible pour la configuration systeme et le deploiement applicatif. Chaque instance execute Caddy et l'application, et chaque Caddy peut router vers le backend local et celui du pair via le reseau prive.
 
-## Ce que le dépôt provisionne
+## Ce que le depot provisionne
 
 - 1 VPC avec `enable_dns_support` et `enable_dns_hostnames`
 - 1 Internet Gateway
-- 2 subnets publics, idéalement dans 2 AZ différentes
+- 2 subnets publics, idealement dans 2 AZ differentes
 - 1 route table publique avec route `0.0.0.0/0`
-- 1 security group partagé pour SSH, HTTP et HTTPS
+- 1 security group partage pour SSH, HTTP, HTTPS et le trafic applicatif inter-noeuds
 - 2 instances EC2 Ubuntu 22.04 LTS Canonical
-- 2 Elastic IPs, une par nœud
+- 2 Elastic IPs, une par noeud
 - 1 IAM role EC2 avec SSM et CloudWatch Agent policies
-- 4 log groups CloudWatch au total, 2 par nœud (`app` et `caddy`)
-- 2 alarmes CloudWatch par nœud
+- 4 log groups CloudWatch au total, 2 par noeud (`app` et `caddy`)
+- 2 alarmes CloudWatch par noeud
 - 1 topic SNS optionnel si des emails d'alerte sont fournis
-- des paramètres SSM SecureString optionnels
+- des parametres SSM SecureString optionnels
 
 ## Topologie applicative
 
-- Le trafic normal doit pointer vers l'Elastic IP du nœud primaire.
-- Le nœud secondaire reste prêt à servir mais ne reçoit pas le trafic tant que le DNS externe n'est pas modifié.
+- Chaque instance execute une stack `Caddy -> app NestJS`.
+- Caddy peut equilibrer vers l'app locale et l'app distante en utilisant les IPs privees EC2 et un health check HTTP sur `app_healthcheck_path`.
+- En mode le plus robuste, le DNS externe peut publier les 2 Elastic IPs pour distribuer l'entree entre les deux noeuds.
+- Si votre provider DNS ou votre strategie TLS ne permet pas ce mode, vous pouvez garder un seul `A` record public tout en profitant du failover backend inter-noeuds.
 - Caddy termine HTTP ou HTTPS directement sur chaque instance.
-- L'application NestJS n'est jamais clonée sur les serveurs: seul le conteneur Docker Hub est déployé.
-- Les logs Docker sont envoyés dans CloudWatch Logs via le driver `awslogs`.
+- L'application NestJS n'est jamais clonee sur les serveurs: seul le conteneur Docker Hub est deploye.
+- Les logs Docker sont envoyes dans CloudWatch Logs via le driver `awslogs`.
 
 ## Arborescence
 
@@ -47,19 +49,19 @@ docs/
   manual-failover-runbook.md
 ```
 
-## Prérequis opérateur
+## Prerequis operateur
 
 - Terraform `>= 1.5`
 - provider AWS `~> 5.0`
-- Ansible installé sur la machine d'exécution
-- accès AWS déjà configuré (`AWS_PROFILE`, variables d'environnement AWS ou SSO)
+- Ansible installe sur la machine d'execution
+- acces AWS deja configure (`AWS_PROFILE`, variables d'environnement AWS ou SSO)
 - une key pair EC2 existante
-- l'image Docker Hub de l'API NestJS déjà publiée
-- un provider DNS externe permettant de modifier le `A` record
+- l'image Docker Hub de l'API NestJS deja publiee
+- un provider DNS externe permettant soit de publier 2 `A` records, soit de modifier rapidement le `A` record actif
 
 ## Mise en route rapide
 
-1. Préparer la configuration locale:
+1. Preparer la configuration locale:
 
 ```bash
 cp terraform/terraform.tfvars.example terraform/terraform.tfvars
@@ -75,7 +77,7 @@ cp terraform/terraform.tfvars.example terraform/terraform.tfvars
 - `domain_name` si vous voulez HTTPS automatique avec Caddy
 - `caddy_email` si vous voulez enregistrer un email ACME
 
-3. Lancer le déploiement:
+3. Lancer le deploiement:
 
 ```bash
 PRIVATE_KEY_PATH=~/.ssh/my-ec2-key.pem ./deploy.sh
@@ -99,52 +101,38 @@ Exemple avec overrides CLI:
 
 Le script:
 
-1. charge automatiquement `terraform/terraform.tfvars` si présent
-2. charge automatiquement `terraform/backend.hcl` si présent
+1. charge automatiquement `terraform/terraform.tfvars` si present
+2. charge automatiquement `terraform/backend.hcl` si present
 3. accepte des overrides via variables d'environnement et flags CLI
 4. exige `PRIVATE_KEY_PATH`
-5. exécute `terraform init`
-6. exécute `terraform apply`
-7. lit les outputs Terraform utiles au déploiement
-8. génère `ansible/inventory.ini` avec `primary` et `secondary` si activé
-9. attend la disponibilité SSH sur chaque nœud
-10. exécute `ansible/playbook.yml`
-
-Si vous fournissez une configuration backend S3, `deploy.sh` génère un fichier Terraform local temporaire de backend pour permettre l'usage d'un state distant sans imposer S3 comme mode par défaut.
+5. execute `terraform init`
+6. execute `terraform apply`
+7. lit les outputs Terraform utiles au deploiement
+8. genere `ansible/inventory.ini` avec `primary` et `secondary` si active
+9. injecte les IPs publiques et privees de chaque noeud dans l'inventaire Ansible
+10. attend la disponibilite SSH sur chaque noeud
+11. execute `ansible/playbook.yml`
 
 ## Fournir un `.env` local
 
-Si l'application a besoin de secrets ou de variables d'environnement, vous pouvez soit laisser `deploy.sh` auto-détecter `./.env.production`, soit fournir explicitement un fichier local via `APP_ENV_FILE` ou `--app-env-file`.
+Si l'application a besoin de secrets ou de variables d'environnement, vous pouvez soit laisser `deploy.sh` auto-detecter `./.env.production`, soit fournir explicitement un fichier local via `APP_ENV_FILE` ou `--app-env-file`.
 
-Le fichier détecté est uniquement utilisé comme fichier d'environnement applicatif pour le conteneur NestJS. Il est copié vers `/opt/nestjs-caddy/.env` sur chaque instance avec des permissions `0600`, mais il n'est pas chargé localement pour Terraform ni pour la configuration du poste de contrôle Ansible.
-
-Les credentials AWS nécessaires à Terraform doivent venir de votre shell, de `AWS_PROFILE` ou de votre configuration AWS locale, pas de `.env.production`.
-
-Exemple avec auto-détection de `./.env.production`:
-
-```bash
-PRIVATE_KEY_PATH=~/.ssh/my-ec2-key.pem ./deploy.sh
-```
-
-Exemple avec un autre fichier:
-
-```bash
-APP_ENV_FILE=./env/prod.env PRIVATE_KEY_PATH=~/.ssh/my-ec2-key.pem ./deploy.sh
-```
-
-Le dépôt inclut aussi un `.gitignore` pour éviter de committer accidentellement `.env.production`, `terraform/terraform.tfvars` et les fichiers de state locaux.
+Le fichier detecte est uniquement utilise comme fichier d'environnement applicatif pour le conteneur NestJS. Il est copie vers `/opt/nestjs-caddy/.env` sur chaque instance avec des permissions `0600`, mais il n'est pas charge localement pour Terraform ni pour la configuration du poste de controle Ansible.
 
 ## Outputs Terraform utiles
 
-Quelques outputs importants après `terraform apply`:
+Quelques outputs importants apres `terraform apply`:
 
 - `app_url`
 - `health_url`
 - `elastic_ip`
 - `secondary_elastic_ip`
+- `private_ip`
+- `secondary_private_ip`
+- `external_dns_failover_targets`
+- `external_dns_active_active_targets`
 - `ssh_command`
 - `secondary_ssh_command`
-- `external_dns_failover_targets`
 - `cloudwatch_log_group_app`
 - `cloudwatch_log_group_caddy`
 - `ops_alerts_topic_arn`
@@ -154,10 +142,11 @@ Exemple:
 ```bash
 terraform -chdir=terraform output app_url
 terraform -chdir=terraform output external_dns_failover_targets
+terraform -chdir=terraform output external_dns_active_active_targets
 terraform -chdir=terraform output ssh_commands
 ```
 
-## Vérifier les logs CloudWatch
+## Verifier les logs CloudWatch
 
 Les logs attendus sont:
 
@@ -194,15 +183,17 @@ docker inspect nestjs-app
 sudo ufw status verbose
 ```
 
-## Sécurité et points d'attention
+## Securite et points d'attention
 
-- SSH n'est autorisé que depuis `admin_cidr` au niveau AWS et UFW.
-- HTTP et HTTPS restent exposés à Internet, car Caddy termine le trafic en frontal.
-- `PRIVATE_KEY_PATH` doit rester sur le poste opérateur, jamais sur le dépôt.
+- SSH n'est autorise que depuis `admin_cidr` au niveau AWS et UFW.
+- HTTP et HTTPS restent exposes a Internet, car Caddy termine le trafic en frontal.
+- Le port applicatif `3000` n'est plus limite au loopback: il est ouvert uniquement entre les instances du cluster au niveau Security Group et UFW pour permettre le proxy inter-noeuds.
+- `PRIVATE_KEY_PATH` doit rester sur le poste operateur, jamais sur le depot.
 - Les secrets applicatifs peuvent vivre dans un `.env` local et/ou dans SSM Parameter Store.
-- Le modèle est simple mais ne remplace pas un vrai HA managé avec ALB, Auto Scaling, health checks distribués et certificats centralisés.
+- Le mode DNS a 2 `A` records ameliore la disponibilite mais reste un equilibrage best effort cote client ou resolver, pas l'equivalent d'un vrai ALB.
+- Le modele reste simple et low-cost, mais ne remplace pas un vrai HA manage avec ALB, Auto Scaling, health checks distribues et certificats centralises.
 
-## Documentation complémentaire
+## Documentation complementaire
 
 - [Low-cost failover](docs/low-cost-failover.md)
 - [Manual failover runbook](docs/manual-failover-runbook.md)

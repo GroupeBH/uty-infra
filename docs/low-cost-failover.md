@@ -1,95 +1,89 @@
-# Low-cost active-passive design for uty-api
+# Low-cost two-node design for uty-api
 
 ## Intent
 
-Le but est de garder une infrastructure très simple à opérer et peu coûteuse, tout en évitant le point de défaillance unique le plus évident: l'instance applicative. On accepte donc un failover manuel DNS au lieu d'un basculement automatique via ALB, Route 53 health checks ou Auto Scaling.
+Le but est de garder une infrastructure tres simple a operer et peu couteuse, tout en reduisant les points de defaillance les plus evidents. Le design reste volontairement plus leger qu'une pile ALB + Auto Scaling, mais chaque noeud peut desormais servir l'application et chaque Caddy sait router vers le backend local et distant.
 
 ## Architecture exacte
 
-- 1 VPC unique en `us-east-1`
+- 1 VPC unique
 - 2 subnets publics
 - 1 IGW et 1 route table publique
-- 1 security group partagé
+- 1 security group partage
 - 1 instance primaire `uty-api`
 - 1 instance secondaire `uty-api-secondary`
-- 1 Elastic IP par nœud
+- 1 Elastic IP par noeud
 - 1 IAM role EC2 compatible SSM et CloudWatch
-- 2 log groups par nœud: `app` et `caddy`
-- 2 alarmes CloudWatch par nœud:
-  - `StatusCheckFailed_System` avec recovery EC2
-  - `StatusCheckFailed_Instance`
+- 2 log groups par noeud: `app` et `caddy`
+- 2 alarmes CloudWatch par noeud
 - 1 SNS topic optionnel
-- 1 map optionnelle de paramètres SSM SecureString
+- 1 map optionnelle de parametres SSM SecureString
 
-## Pourquoi ce design est low-cost
+## Pourquoi ce design reste low-cost
 
-Le coût reste contenu parce que:
+Le cout reste contenu parce que:
 
 - il n'y a pas d'ALB
 - il n'y a pas de NAT Gateway
 - il n'y a pas d'Auto Scaling Group
-- il n'y a pas de bastion dédié
-- la taille par défaut reste `t3.micro`
+- il n'y a pas de bastion dedie
+- la taille par defaut reste `t3.micro`
 - le trafic Internet passe directement vers les instances publiques
 
-Tradeoffs assumés:
+Compromis acceptes:
 
-- le failover est manuel
-- il n'y a pas de health-based routing natif côté DNS AWS
-- il n'y a pas de terminaison TLS centralisée
-- le standby coûte une petite base EC2 + EIP + stockage, mais moins qu'une pile HA complète
+- le routage public depend toujours d'un DNS externe
+- il n'y a pas de health-based routing natif cote DNS AWS
+- il n'y a pas de terminaison TLS centralisee
+- il n'y a pas de coordination globale des certificats TLS entre noeuds sans stockage partage Caddy ou challenge DNS
 
-## Rôle des Elastic IPs
+## Role des Elastic IPs
 
-Les Elastic IPs jouent trois rôles importants:
+Les Elastic IPs jouent trois roles importants:
 
-- elles donnent une cible DNS stable pour le primaire et le secondaire
-- elles rendent le runbook de failover très simple: changer le `A` record vers l'IP secondaire
-- elles évitent de dépendre de l'adresse publique dynamique d'EC2
+- elles donnent une cible DNS stable pour chaque noeud public
+- elles permettent soit un mode a 2 `A` records, soit un drain manuel simple en retirant un noeud du DNS
+- elles evitent de dependre de l'adresse publique dynamique d'EC2
 
 En mode nominal:
 
-- le DNS externe pointe vers l'EIP du primaire
-- l'EIP du secondaire reste connue mais non utilisée publiquement
+- vous pouvez soit publier les 2 EIPs en parallele, soit n'en publier qu'une seule si vous restez en mode plus conservateur
+- meme avec un seul `A` record public, Caddy peut continuer a servir via l'autre backend applicatif si le backend local tombe
 
-## Stratégie DNS externe
+## Strategie DNS externe
 
-Le DNS n'est pas géré dans AWS. Ce dépôt suppose donc:
+Le DNS n'est pas gere dans AWS. Ce depot suppose donc:
 
-- un `A` record externe pour le domaine applicatif
-- un TTL court, recommandé à `60` secondes
-- une capacité opérateur à modifier le record rapidement en incident
+- un provider DNS externe pouvant idealement publier 2 `A` records pour le domaine applicatif
+- un TTL court, recommande a `60` secondes
+- une capacite operateur a retirer rapidement une cible DNS degradee en incident
 
-Exemples de stratégies possibles chez un provider externe:
+Exemples de strategies possibles chez un provider externe:
 
-- un simple `A` record modifié manuellement
-- deux enregistrements documentés, dont un seul actif à la fois
-- un mode failover du provider DNS si celui-ci existe, mais piloté hors AWS
+- deux `A` records actifs en parallele
+- un simple `A` record modifie manuellement si vous gardez un seul ingress public
+- un mode failover ou health-checked du provider DNS si celui-ci existe, mais pilote hors AWS
 
-## Modèle de trafic
+## Modele de trafic
 
-- Le primaire reçoit le trafic normal.
-- Le secondaire est un standby prêt à être promu par bascule DNS.
-- Les deux nœuds peuvent techniquement servir l'API, mais le design opérationnel impose un seul point de trafic public à la fois.
+- Chaque noeud execute Caddy et l'application NestJS.
+- Chaque Caddy peut joindre son backend local via Docker et le backend distant via l'IP privee EC2 sur le port `3000`.
+- Si les 2 Elastic IPs sont publiees dans le DNS, le trafic peut entrer par les 2 noeuds.
+- Si un backend applicatif devient indisponible, Caddy peut continuer a router vers le backend sain.
+- Si un noeud public complet devient indisponible, retirer son IP du DNS reste l'action operatoire la plus simple.
 
-Ce modèle fonctionne bien pour une API stateless ou quasi-stateless. Si l'application porte de l'état local non répliqué, ce design ne suffit pas à garantir une reprise propre.
+Ce modele fonctionne bien pour une API stateless ou quasi-stateless. Si l'application porte de l'etat local non replique, ce design ne suffit pas a garantir une reprise propre.
 
-## Stratégie de déploiement Docker Hub
+## Strategie de deploiement Docker Hub
 
-Le dépôt backend n'est jamais cloné sur les serveurs. Le flux attendu est:
+Le depot backend n'est jamais clone sur les serveurs. Le flux attendu est:
 
 1. build et push de l'image NestJS vers Docker Hub
-2. mise à jour de `app_image_tag` ou redéploiement du tag cible
-3. `deploy.sh` exécute Terraform puis Ansible
+2. mise a jour de `app_image_tag` ou redeploiement du tag cible
+3. `deploy.sh` execute Terraform puis Ansible
 4. Ansible fait `docker compose pull app` puis `docker compose up -d --remove-orphans`
 
-Avantages:
-
-- serveurs plus simples
-- surface d'attaque plus faible qu'un `git clone` + build local
-- déploiement reproductible et aligné sur le tag d'image
-
-## Logs et observabilité
+## Logs et observabilite
 
 Chaque conteneur envoie ses logs vers CloudWatch Logs via `awslogs`.
 
@@ -102,48 +96,38 @@ Groupes de logs:
   - `/uty-api-secondary/app`
   - `/uty-api-secondary/caddy`
 
-CloudWatch couvre aussi deux alarmes EC2 par nœud. Le `StatusCheckFailed_System` tente une récupération EC2 native. Le `StatusCheckFailed_Instance` sert d'alerte opérateur.
-
-## Secrets et configuration applicative
-
-Deux modèles sont prévus:
-
-- fichier `.env` local copié par Ansible
-- paramètres SSM SecureString créés par Terraform
-
-Le design ne force pas l'un ou l'autre. Pour un runtime NestJS classique, le `.env` reste le plus simple si l'image sait le consommer.
+CloudWatch couvre aussi deux alarmes EC2 par noeud. Le `StatusCheckFailed_System` tente une recuperation EC2 native. Le `StatusCheckFailed_Instance` sert d'alerte operateur.
 
 ## Limites HTTPS avec Caddy sans ALB
 
-C'est le point le plus important à comprendre.
+Quand `domain_name` est configure, Caddy gere automatiquement les certificats sur chaque instance qui recoit le trafic. Dans un modele a plusieurs noeuds sans ALB ni stockage partage Caddy:
 
-Quand `domain_name` est configuré, Caddy gère automatiquement les certificats sur l'instance qui reçoit le trafic. Dans un modèle active-passive sans ALB:
+- chaque noeud peut tenter d'emettre ou renouveler un certificat pour le meme domaine
+- avec 2 `A` records publics, le challenge ACME peut etre plus delicat qu'avec une terminaison TLS centralisee
+- si vous utilisez HTTP-01 ou TLS-ALPN-01, la robustesse TLS depend du comportement de votre DNS externe et du timing de validation
+- pour un fonctionnement vraiment robuste a plusieurs noeuds, un challenge DNS ou un stockage partage Caddy est preferable
 
-- le primaire obtient normalement le certificat tant que le DNS pointe sur lui
-- le secondaire peut ne pas obtenir ou renouveler son certificat tant que le DNS ne pointe pas vers son EIP
-- lors d'un failover, il peut y avoir un délai pendant lequel Caddy doit émettre ou renouveler le certificat sur le secondaire
-- si vous utilisez un challenge HTTP-01/TLS-ALPN-01, l'instance passive ne peut pas préchauffer le certificat sans recevoir réellement le trafic du domaine
+Consequence operationnelle:
 
-Conséquence opérationnelle:
+- le HTTP interne et le failover backend sont ameliores, mais la gestion des certificats reste moins robuste qu'avec ALB + ACM
+- gardez un TTL bas, testez regulierement le comportement DNS et envisagez un challenge DNS ou un stockage partage Caddy si vous voulez un vrai multi-ingress HTTPS durable
 
-- le failover HTTPS n'est pas aussi fluide qu'avec un ALB ou un certificate manager centralisé
-- pour réduire le risque, gardez un TTL bas, testez régulièrement le basculement et envisagez un challenge DNS si votre provider externe et votre stratégie Caddy le permettent dans le futur
-
-## Sécurité
+## Securite
 
 - Security Group: SSH seulement depuis `admin_cidr`, HTTP/HTTPS publics, egress ouvert
-- UFW: même politique côté OS
+- port `3000` ouvert uniquement entre instances partageant le security group
+- UFW: meme politique cote OS
 - IMDSv2 requis sur les instances
 - IAM minimal pour SSM et CloudWatch Agent policy
-- pas de port applicatif `3000` exposé à Internet, seulement `127.0.0.1:3000`
+- pas de port applicatif `3000` expose a Internet, seulement au reseau prive entre noeuds
 - reverse proxy Caddy en frontal
 
-## Quand faire évoluer ce design
+## Quand faire evoluer ce design
 
 Il faut envisager ALB + ACM + Auto Scaling ou ECS/Fargate si vous avez besoin de:
 
 - failover automatique
-- certificats TLS centralisés sans dépendance au nœud actif
-- blue/green ou rolling deploys plus avancés
-- séparation réseau plus stricte avec subnets privés
-- métriques et health checks plus fins
+- certificats TLS centralises sans dependance a chaque noeud
+- blue/green ou rolling deploys plus avances
+- separation reseau plus stricte avec subnets prives
+- metriques et health checks plus fins
