@@ -56,7 +56,15 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y ansible awscli openssh-client
+          sudo apt-get install -y ansible curl openssh-client unzip
+          if ! command -v aws >/dev/null 2>&1; then
+            curl --fail --silent --show-error \
+              "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
+              --output "$RUNNER_TEMP/awscliv2.zip"
+            unzip -q "$RUNNER_TEMP/awscliv2.zip" -d "$RUNNER_TEMP"
+            sudo "$RUNNER_TEMP/aws/install" --update
+          fi
+          aws --version
 
       - name: Restore Terraform variables
         shell: bash
