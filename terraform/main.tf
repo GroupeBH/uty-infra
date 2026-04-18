@@ -62,6 +62,7 @@ locals {
   alternate_azs          = [for az in data.aws_availability_zones.available.names : az if az != var.availability_zone]
   effective_secondary_az = var.secondary_availability_zone != "" ? var.secondary_availability_zone : (length(local.alternate_azs) > 0 ? local.alternate_azs[0] : var.availability_zone)
   effective_ami_id       = var.ami_id != "" ? var.ami_id : data.aws_ami.ubuntu[0].id
+  admin_cidrs            = distinct(compact(concat([var.admin_cidr], var.additional_admin_cidrs)))
 
   primary_instance_name   = var.instance_name
   secondary_instance_name = "${var.instance_name}-secondary"
@@ -160,11 +161,11 @@ resource "aws_security_group" "app" {
   vpc_id      = aws_vpc.main.id
 
   ingress {
-    description = "SSH from admin CIDR"
+    description = "SSH from admin CIDRs"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = [var.admin_cidr]
+    cidr_blocks = local.admin_cidrs
   }
 
   ingress {

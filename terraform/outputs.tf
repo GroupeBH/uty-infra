@@ -120,6 +120,21 @@ output "deploy_admin_cidr" {
   value = var.admin_cidr
 }
 
+output "deploy_admin_cidrs" {
+  value = local.admin_cidrs
+}
+
+output "deploy_admin_cidrs_csv" {
+  value = join(",", local.admin_cidrs)
+}
+
+output "deploy_instance_ids_csv" {
+  value = join(",", compact([
+    aws_instance.primary.id,
+    try(aws_instance.secondary[0].id, null),
+  ]))
+}
+
 output "deploy_app_image_repository" {
   value = var.app_image_repository
 }

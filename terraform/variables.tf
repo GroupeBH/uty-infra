@@ -62,6 +62,12 @@ variable "admin_cidr" {
   type        = string
 }
 
+variable "additional_admin_cidrs" {
+  description = "Additional CIDR blocks allowed to SSH to both nodes, for example a CI runner public IP."
+  type        = list(string)
+  default     = []
+}
+
 variable "instance_name" {
   description = "Base instance name. Primary keeps this exact value."
   type        = string

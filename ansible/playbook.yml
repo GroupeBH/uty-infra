@@ -18,14 +18,14 @@
     - name: Validate mandatory inputs
       ansible.builtin.assert:
         that:
-          - admin_cidr is defined
-          - admin_cidr | length > 0
           - aws_region is defined
           - aws_region | length > 0
           - app_image_repository is defined
           - app_image_repository | length > 0
           - app_image_tag is defined
           - app_image_tag | length > 0
+          - admin_cidrs is defined
+          - admin_cidrs | length > 0
           - instance_name is defined
           - instance_name | length > 0
           - private_ip is defined
@@ -288,7 +288,9 @@
         ufw --force reset
         ufw default deny incoming
         ufw default allow outgoing
-        ufw allow from {{ admin_cidr }} to any port 22 proto tcp
+        {% for cidr in admin_cidrs %}
+        ufw allow from {{ cidr }} to any port 22 proto tcp
+        {% endfor %}
         {% for cluster_ip in app_cluster_private_ips %}
         ufw allow from {{ cluster_ip }} to any port {{ app_port }} proto tcp
         {% endfor %}

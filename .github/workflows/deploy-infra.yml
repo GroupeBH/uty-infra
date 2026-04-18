@@ -1,0 +1,132 @@
+name: Deploy infra
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Docker image tag to deploy
+        required: false
+        default: latest
+        type: string
+      app_image_repository:
+        description: Docker Hub repository override
+        required: false
+        type: string
+  repository_dispatch:
+    types:
+      - backend-image-published
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uty-infra-deploy-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'eu-central-1' }}
+  APP_IMAGE_REPOSITORY: ${{ github.event.client_payload.image_repository || github.event.inputs.app_image_repository || vars.APP_IMAGE_REPOSITORY }}
+  APP_IMAGE_TAG: ${{ github.event.client_payload.image_tag || github.event.inputs.image_tag || vars.APP_IMAGE_TAG || 'latest' }}
+
+jobs:
+  deploy:
+    name: Terraform and Ansible deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout infra repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Install deploy dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ansible awscli openssh-client
+
+      - name: Restore Terraform variables
+        shell: bash
+        env:
+          TERRAFORM_TFVARS: ${{ secrets.TERRAFORM_TFVARS }}
+        run: |
+          set -euo pipefail
+          if [ -n "$TERRAFORM_TFVARS" ]; then
+            printf '%s\n' "$TERRAFORM_TFVARS" > terraform/terraform.tfvars
+          fi
+
+      - name: Restore application env file
+        id: app_env
+        shell: bash
+        env:
+          APP_ENV_PRODUCTION: ${{ secrets.APP_ENV_PRODUCTION }}
+        run: |
+          set -euo pipefail
+          if [ -n "$APP_ENV_PRODUCTION" ]; then
+            app_env_path="$RUNNER_TEMP/uty-api.env"
+            printf '%s\n' "$APP_ENV_PRODUCTION" > "$app_env_path"
+            echo "path=$app_env_path" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure SSH private key
+        id: ssh_key
+        shell: bash
+        env:
+          EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$EC2_SSH_PRIVATE_KEY"
+          key_path="$RUNNER_TEMP/uty-ec2.pem"
+          printf '%s\n' "$EC2_SSH_PRIVATE_KEY" > "$key_path"
+          chmod 600 "$key_path"
+          echo "path=$key_path" >> "$GITHUB_OUTPUT"
+
+      - name: Detect runner public CIDR
+        id: runner_network
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_ip="$(curl --fail --silent --show-error https://checkip.amazonaws.com | tr -d '[:space:]')"
+          if ! [[ "$runner_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Could not detect a valid IPv4 address for the GitHub runner." >&2
+            exit 1
+          fi
+          echo "cidr=${runner_ip}/32" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy infrastructure
+        shell: bash
+        env:
+          PRIVATE_KEY_PATH: ${{ steps.ssh_key.outputs.path }}
+          APP_ENV_FILE: ${{ steps.app_env.outputs.path }}
+          TF_VAR_additional_admin_cidrs: '["${{ steps.runner_network.outputs.cidr }}"]'
+          AWS_REGION: ${{ env.AWS_REGION }}
+          KEY_NAME: ${{ vars.KEY_NAME }}
+          ADMIN_CIDR: ${{ vars.ADMIN_CIDR }}
+          DOMAIN: ${{ vars.DOMAIN }}
+          CADDY_EMAIL: ${{ vars.CADDY_EMAIL }}
+          INSTANCE_NAME: ${{ vars.INSTANCE_NAME }}
+          INSTANCE_TYPE: ${{ vars.INSTANCE_TYPE }}
+          APP_IMAGE_REPOSITORY: ${{ env.APP_IMAGE_REPOSITORY }}
+          APP_IMAGE_TAG: ${{ env.APP_IMAGE_TAG }}
+          APP_HEALTHCHECK_PATH: ${{ vars.APP_HEALTHCHECK_PATH }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          chmod +x ./deploy.sh
+          ./deploy.sh

@@ -30,6 +30,9 @@ Cette base deploie une API NestJS packagee sur Docker Hub derriere Caddy, avec u
 ## Arborescence
 
 ```text
+.github/
+  workflows/
+    deploy-infra.yml
 terraform/
   main.tf
   variables.tf
@@ -47,6 +50,7 @@ deploy.sh
 docs/
   low-cost-failover.md
   manual-failover-runbook.md
+  backend-deploy-trigger.md
 ```
 
 ## Prerequis operateur
@@ -73,6 +77,7 @@ cp terraform/terraform.tfvars.example terraform/terraform.tfvars
 
 - `key_name`
 - `admin_cidr`
+- `additional_admin_cidrs` si un runner CI doit aussi se connecter en SSH
 - `app_image_repository`
 - `domain_name` si vous voulez HTTPS automatique avec Caddy
 - `caddy_email` si vous voulez enregistrer un email ACME
@@ -113,6 +118,14 @@ Le script:
 10. attend la disponibilite SSH sur chaque noeud
 11. execute `ansible/playbook.yml`
 
+## Deploiement automatique depuis le backend
+
+Le workflow `.github/workflows/deploy-infra.yml` peut etre lance manuellement ou par `repository_dispatch` avec l'evenement `backend-image-published`. Le repo backend peut donc declencher ce repo infra juste apres avoir pousse l'image Docker Hub.
+
+Le workflow ajoute automatiquement l'IP publique du runner GitHub Actions dans `additional_admin_cidrs`, puis execute `deploy.sh`. Cela permet a Terraform d'ouvrir SSH pour le runner pendant le deploiement Ansible, tout en conservant `admin_cidr` pour l'acces operateur. Avant la connexion SSH, `deploy.sh` tente aussi une preconfiguration UFW via AWS SSM pour les instances deja deployees.
+
+Voir [Backend deploy trigger](docs/backend-deploy-trigger.md).
+
 ## Fournir un `.env` local
 
 Si l'application a besoin de secrets ou de variables d'environnement, vous pouvez soit laisser `deploy.sh` auto-detecter `./.env.production`, soit fournir explicitement un fichier local via `APP_ENV_FILE` ou `--app-env-file`.
@@ -136,6 +149,9 @@ Quelques outputs importants apres `terraform apply`:
 - `cloudwatch_log_group_app`
 - `cloudwatch_log_group_caddy`
 - `ops_alerts_topic_arn`
+- `deploy_admin_cidrs`
+- `deploy_admin_cidrs_csv`
+- `deploy_instance_ids_csv`
 
 Exemple:
 
@@ -185,7 +201,7 @@ sudo ufw status verbose
 
 ## Securite et points d'attention
 
-- SSH n'est autorise que depuis `admin_cidr` au niveau AWS et UFW.
+- SSH n'est autorise que depuis `admin_cidr` et `additional_admin_cidrs` au niveau AWS et UFW.
 - HTTP et HTTPS restent exposes a Internet, car Caddy termine le trafic en frontal.
 - Le port applicatif `3000` n'est plus limite au loopback: il est ouvert uniquement entre les instances du cluster au niveau Security Group et UFW pour permettre le proxy inter-noeuds.
 - `PRIVATE_KEY_PATH` doit rester sur le poste operateur, jamais sur le depot.
@@ -197,3 +213,4 @@ sudo ufw status verbose
 
 - [Low-cost failover](docs/low-cost-failover.md)
 - [Manual failover runbook](docs/manual-failover-runbook.md)
+- [Backend deploy trigger](docs/backend-deploy-trigger.md)

@@ -77,6 +77,30 @@ yaml_escape() {
   printf '%s' "$value"
 }
 
+json_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  printf '%s' "$value"
+}
+
+json_string_array() {
+  local item
+  local first=true
+  printf '['
+  for item in "$@"; do
+    [[ -n "$item" ]] || continue
+    if [[ "$first" == true ]]; then
+      first=false
+    else
+      printf ','
+    fi
+    printf '"%s"' "$(json_escape "$item")"
+  done
+  printf ']'
+}
+
 validate_aws_credentials() {
   if [[ -n "${AWS_ACCESS_KEY_ID:-}" ]]; then
     if [[ "$AWS_ACCESS_KEY_ID" == ASIA* && -z "${AWS_SESSION_TOKEN:-}" ]]; then
@@ -123,6 +147,73 @@ wait_for_ssh() {
   done
 
   return 1
+}
+
+prepare_ssh_firewall_with_ssm() {
+  [[ -n "${DEPLOY_INSTANCE_IDS_CSV:-}" ]] || return 0
+  [[ -n "${DEPLOY_ADMIN_CIDRS_CSV:-}" ]] || return 0
+
+  if ! command -v aws >/dev/null 2>&1; then
+    log "AWS CLI not found; skipping SSM SSH firewall preflight."
+    return 0
+  fi
+
+  local -a instance_ids
+  local -a admin_cidrs
+  local -a commands
+  local instance_id
+  local cidr
+  local ssm_payload
+  local command_id
+
+  IFS=',' read -r -a instance_ids <<< "$DEPLOY_INSTANCE_IDS_CSV"
+  IFS=',' read -r -a admin_cidrs <<< "$DEPLOY_ADMIN_CIDRS_CSV"
+
+  commands=("set -eu")
+  for cidr in "${admin_cidrs[@]}"; do
+    [[ -n "$cidr" ]] || continue
+    commands+=("if command -v ufw >/dev/null 2>&1; then ufw allow from $cidr to any port 22 proto tcp; fi")
+  done
+
+  [[ "${#instance_ids[@]}" -gt 0 ]] || return 0
+  [[ "${#commands[@]}" -gt 1 ]] || return 0
+
+  log "Preparing SSH firewall rules through AWS SSM"
+  ssm_payload="$(mktemp)"
+  {
+    printf '{'
+    printf '"DocumentName":"AWS-RunShellScript",'
+    printf '"InstanceIds":'
+    json_string_array "${instance_ids[@]}"
+    printf ','
+    printf '"Parameters":{"commands":'
+    json_string_array "${commands[@]}"
+    printf '},'
+    printf '"Comment":"Allow deployment SSH CIDRs before Ansible"'
+    printf '}'
+  } > "$ssm_payload"
+
+  if ! command_id="$(aws ssm send-command \
+    --region "$DEPLOY_REGION" \
+    --cli-input-json "file://$ssm_payload" \
+    --query 'Command.CommandId' \
+    --output text 2>/dev/null)"; then
+    rm -f "$ssm_payload"
+    log "SSM SSH firewall preflight could not be started; continuing with direct SSH checks."
+    return 0
+  fi
+
+  rm -f "$ssm_payload"
+
+  for instance_id in "${instance_ids[@]}"; do
+    [[ -n "$instance_id" ]] || continue
+    if ! aws ssm wait command-executed \
+      --region "$DEPLOY_REGION" \
+      --command-id "$command_id" \
+      --instance-id "$instance_id" 2>/dev/null; then
+      log "SSM SSH firewall preflight did not complete on $instance_id; continuing with direct SSH checks."
+    fi
+  done
 }
 
 AWS_REGION="${AWS_REGION:-}"
@@ -309,7 +400,9 @@ SECONDARY_ENABLED="$(terraform_output_raw deploy_secondary_enabled)"
 SECONDARY_IP="$(terraform_output_raw deploy_secondary_public_ip || true)"
 SECONDARY_PRIVATE_IP="$(terraform_output_raw deploy_secondary_private_ip || true)"
 DEPLOY_REGION="$(terraform_output_raw deploy_region)"
-DEPLOY_ADMIN_CIDR="$(terraform_output_raw deploy_admin_cidr)"
+DEPLOY_ADMIN_CIDRS="$(terraform -chdir="$TERRAFORM_DIR" output -json deploy_admin_cidrs)"
+DEPLOY_ADMIN_CIDRS_CSV="$(terraform_output_raw deploy_admin_cidrs_csv)"
+DEPLOY_INSTANCE_IDS_CSV="$(terraform_output_raw deploy_instance_ids_csv)"
 DEPLOY_INSTANCE_NAME="$(terraform_output_raw deploy_instance_name)"
 DEPLOY_DOMAIN_NAME="$(terraform_output_raw deploy_domain_name || true)"
 DEPLOY_CADDY_EMAIL="$(terraform_output_raw deploy_caddy_email || true)"
@@ -328,8 +421,10 @@ if [[ "$SECONDARY_ENABLED" == "true" && -n "$SECONDARY_IP" ]]; then
     "$SECONDARY_IP" \
     "$SSH_USER" \
     "${DEPLOY_INSTANCE_NAME}-secondary" \
-    "$SECONDARY_PRIVATE_IP" >> "$ANSIBLE_DIR/inventory.ini"
+  "$SECONDARY_PRIVATE_IP" >> "$ANSIBLE_DIR/inventory.ini"
 fi
+
+prepare_ssh_firewall_with_ssm
 
 log "Waiting for SSH on primary ($PRIMARY_IP)"
 wait_for_ssh "$PRIMARY_IP" || fail "SSH did not become ready on primary node."
@@ -342,7 +437,7 @@ fi
 EXTRA_VARS_FILE="$(mktemp)"
 trap 'rm -f "$EXTRA_VARS_FILE"' EXIT
 cat > "$EXTRA_VARS_FILE" <<EOF
-admin_cidr: "$(yaml_escape "$DEPLOY_ADMIN_CIDR")"
+admin_cidrs: $DEPLOY_ADMIN_CIDRS
 aws_region: "$(yaml_escape "$DEPLOY_REGION")"
 domain_name: "$(yaml_escape "$DEPLOY_DOMAIN_NAME")"
 caddy_email: "$(yaml_escape "$DEPLOY_CADDY_EMAIL")"
